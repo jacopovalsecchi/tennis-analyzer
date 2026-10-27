@@ -1,0 +1,4 @@
+video,colpo,t_contatto,braccio,etichetta,fonte,nota
+videos/sample.mov,1,3.821,destro,buono,utente,Linea gialla confermata. Nel colpo c'è almeno un frame con polso incerto.
+videos/sample.mov,2,6.910,destro,buono,utente,Linea gialla confermata. Nel colpo c'è almeno un frame con polso incerto.
+videos/sample.mov,3,10.053,sinistro,buono,utente,Linea gialla confermata. Nel colpo c'è almeno un frame con polso incerto.
