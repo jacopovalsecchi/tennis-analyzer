@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Estrae le feature di ogni colpo dal CSV di MediaPipe.
+"""Extract per-stroke features from a MediaPipe pose CSV.
 
-La racchetta non è un keypoint: la punta stimata prolunga l'avambraccio
-di una lunghezza oltre il polso. Non giudica se il colpo è corretto.
+The racket is not a keypoint: the estimated tip extends the forearm
+one forearm-length past the wrist. Each stroke is labeled forehand or
+backhand from the player's dominant arm.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ MERGE_SECONDS = 0.35
 MIN_FRAMES = 5
 RACKET_EXTENSION = 1.0
 JUMP_TORSO = 0.35
+SEGMENT_PRESENT = 0.25
 
 JOINTS = (
     "l_shoulder",
@@ -33,44 +35,46 @@ JOINTS = (
     "r_hip",
 )
 ARMS = {
-    "sinistro": ("l_shoulder", "l_elbow", "l_wrist"),
-    "destro": ("r_shoulder", "r_elbow", "r_wrist"),
+    "left": ("l_shoulder", "l_elbow", "l_wrist"),
+    "right": ("r_shoulder", "r_elbow", "r_wrist"),
 }
 
 STROKE_FIELDS = [
-    "colpo",
-    "braccio",
-    "t_inizio",
-    "t_contatto",
-    "t_fine",
-    "angolo_gomito_deg",
-    "angolo_racchetta_busto_deg",
-    "velocita_polso",
-    "distanza_spalla_gomito",
-    "distanza_gomito_polso",
-    "distanza_polso_racchetta",
-    "distanza_spalla_racchetta",
-    "direzione_oscillazione_deg",
-    "rotazione_spalle_deg",
-    "rotazione_anche_deg",
-    "lato_contatto",
-    "attraversa_centro",
-    "angolo_ginocchio_sx_deg",
-    "angolo_ginocchio_dx_deg",
-    "da_controllare",
+    "shot",
+    "striking_arm",
+    "stroke_type",
+    "backhand_style",
+    "t_start",
+    "t_contact",
+    "t_end",
+    "elbow_angle_deg",
+    "racket_torso_angle_deg",
+    "wrist_speed",
+    "shoulder_elbow_distance",
+    "elbow_wrist_distance",
+    "wrist_racket_distance",
+    "shoulder_racket_distance",
+    "swing_direction_deg",
+    "shoulder_rotation_deg",
+    "hip_rotation_deg",
+    "contact_side",
+    "crosses_center",
+    "left_knee_angle_deg",
+    "right_knee_angle_deg",
+    "needs_review",
 ]
 FRAME_FIELDS = [
-    "colpo",
+    "shot",
     "frame",
     "time_s",
-    "braccio",
-    "angolo_gomito_deg",
-    "angolo_racchetta_busto_deg",
-    "velocita_polso",
-    "visibilita_polso",
-    "angolo_ginocchio_sx_deg",
-    "angolo_ginocchio_dx_deg",
-    "salto",
+    "striking_arm",
+    "elbow_angle_deg",
+    "racket_torso_angle_deg",
+    "wrist_speed",
+    "wrist_visibility",
+    "left_knee_angle_deg",
+    "right_knee_angle_deg",
+    "jump",
 ]
 
 
@@ -84,13 +88,13 @@ def video_geometry(path: Path) -> tuple[float, float, float]:
 
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
-        raise SystemExit(f"Non riesco ad aprire il video: {path}")
+        raise SystemExit(f"Cannot open the video: {path}")
     width = capture.get(cv2.CAP_PROP_FRAME_WIDTH)
     height = capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
     fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
     capture.release()
     if width <= 0 or height <= 0:
-        raise SystemExit(f"Dimensioni video non valide: {path}")
+        raise SystemExit(f"Invalid video size: {path}")
     return width, height, fps
 
 
@@ -176,7 +180,7 @@ def smooth(values: list[float], radius: int = 2) -> list[float]:
 def wrist_speeds(
     rows: list[dict[str, str]], scale_y: float, fps: float
 ) -> list[dict[str, float]]:
-    previous: dict[str, tuple[float, float] | None] = {"sinistro": None, "destro": None}
+    previous: dict[str, tuple[float, float] | None] = {"left": None, "right": None}
     series: list[dict[str, float]] = []
     for row in rows:
         body = torso(row, scale_y)
@@ -192,28 +196,28 @@ def wrist_speeds(
             current[arm] = step * fps
             current[f"{arm}_step"] = step
             previous[arm] = wrist[:2]
-        current["massima"] = max(current["sinistro"], current["destro"])
+        current["max"] = max(current["left"], current["right"])
         series.append(current)
-    maxima = smooth([item["massima"] for item in series])
+    maxima = smooth([item["max"] for item in series])
     for item, value in zip(series, maxima):
-        item["liscia"] = value
+        item["smooth"] = value
     return series
 
 
 def find_peaks(series: list[dict[str, float]], times: list[float]) -> list[int]:
     candidates: list[int] = []
     for index in range(1, len(series) - 1):
-        speed = series[index]["liscia"]
+        speed = series[index]["smooth"]
         if speed < PEAK_SPEED:
             continue
-        if speed >= series[index - 1]["liscia"] and speed > series[index + 1]["liscia"]:
+        if speed >= series[index - 1]["smooth"] and speed > series[index + 1]["smooth"]:
             candidates.append(index)
     if not candidates:
         return []
     merged = [candidates[0]]
     for index in candidates[1:]:
         if times[index] - times[merged[-1]] <= MERGE_SECONDS:
-            if series[index]["liscia"] > series[merged[-1]]["liscia"]:
+            if series[index]["smooth"] > series[merged[-1]]["smooth"]:
                 merged[-1] = index
         else:
             merged.append(index)
@@ -222,22 +226,63 @@ def find_peaks(series: list[dict[str, float]], times: list[float]) -> list[int]:
 
 def window_bounds(series: list[dict[str, float]], peak: int) -> tuple[int, int]:
     start = peak
-    while start > 0 and series[start - 1]["liscia"] > VALLEY_SPEED:
+    while start > 0 and series[start - 1]["smooth"] > VALLEY_SPEED:
         start -= 1
     end = peak
-    while end < len(series) - 1 and series[end + 1]["liscia"] > VALLEY_SPEED:
+    while end < len(series) - 1 and series[end + 1]["smooth"] > VALLEY_SPEED:
         end += 1
     return start, end
 
 
 def hitting_arm(series: list[dict[str, float]], start: int, end: int, peak: int) -> str:
-    totals = {"sinistro": 0.0, "destro": 0.0}
+    totals = {"left": 0.0, "right": 0.0}
     for index in range(start, end + 1):
-        totals["sinistro"] += series[index]["sinistro"]
-        totals["destro"] += series[index]["destro"]
-    if abs(totals["sinistro"] - totals["destro"]) < 1e-6:
-        return "destro" if series[peak]["destro"] >= series[peak]["sinistro"] else "sinistro"
-    return "destro" if totals["destro"] > totals["sinistro"] else "sinistro"
+        totals["left"] += series[index]["left"]
+        totals["right"] += series[index]["right"]
+    if abs(totals["left"] - totals["right"]) < 1e-6:
+        return "right" if series[peak]["right"] >= series[peak]["left"] else "left"
+    return "right" if totals["right"] > totals["left"] else "left"
+
+
+def segment_visible(row: dict[str, str], name: str) -> bool:
+    raw = row.get(f"{name}_vis", "")
+    if raw == "":
+        return False
+    return float(raw) >= SEGMENT_PRESENT
+
+
+def arm_segment_visible(row: dict[str, str], arm: str) -> bool:
+    """Shoulder–elbow and elbow–wrist are both present for this arm."""
+    shoulder, elbow, wrist = ARMS[arm]
+    return segment_visible(row, shoulder) and segment_visible(row, elbow) and segment_visible(row, wrist)
+
+
+def both_arms_visible(rows: list[dict[str, str]], indexes: list[int]) -> bool:
+    """True when both arm segments are visible on most frames of the shot."""
+    if not indexes:
+        return False
+    present = sum(
+        1
+        for index in indexes
+        if arm_segment_visible(rows[index], "left") and arm_segment_visible(rows[index], "right")
+    )
+    return present / len(indexes) >= 0.5
+
+
+def stroke_type_for(striking_arm: str, dominant_arm: str) -> str:
+    """Dominant arm on the ball is a forehand. The other arm is a backhand."""
+    if striking_arm == dominant_arm:
+        return "forehand"
+    return "backhand"
+
+
+def backhand_style_for(both_arms: bool, preference: str | None) -> str:
+    """Two-handed when both arm segments are visible. Otherwise use the profile, or one-handed."""
+    if both_arms:
+        return "two-handed"
+    if preference in ("one-handed", "two-handed"):
+        return preference
+    return "one-handed"
 
 
 def format_knee(rows: list[dict[str, str]], indexes: list[int], scale_y: float, side: str) -> str:
@@ -291,20 +336,20 @@ def arm_geometry(
         return None
     scale = body[2]
     return {
-        "angolo_gomito_deg": elbow_angle,
-        "angolo_racchetta_busto_deg": racket_angle,
-        "distanza_spalla_gomito": distance(shoulder[:2], elbow[:2]) / scale,
-        "distanza_gomito_polso": forearm_length / scale,
-        "distanza_polso_racchetta": RACKET_EXTENSION * forearm_length / scale,
-        "distanza_spalla_racchetta": distance(shoulder[:2], tip) / scale,
-        "lato_contatto": (wrist[0] - body[0][0]) / scale,
-        "visibilita_polso": wrist[2],
-        "punta_x": tip[0],
-        "punta_y": tip[1],
-        "polso_x": wrist[0],
-        "polso_y": wrist[1],
-        "gomito_x": elbow[0],
-        "gomito_y": elbow[1],
+        "elbow_angle_deg": elbow_angle,
+        "racket_torso_angle_deg": racket_angle,
+        "shoulder_elbow_distance": distance(shoulder[:2], elbow[:2]) / scale,
+        "elbow_wrist_distance": forearm_length / scale,
+        "wrist_racket_distance": RACKET_EXTENSION * forearm_length / scale,
+        "shoulder_racket_distance": distance(shoulder[:2], tip) / scale,
+        "contact_side": (wrist[0] - body[0][0]) / scale,
+        "wrist_visibility": wrist[2],
+        "tip_x": tip[0],
+        "tip_y": tip[1],
+        "wrist_x": wrist[0],
+        "wrist_y": wrist[1],
+        "elbow_x": elbow[0],
+        "elbow_y": elbow[1],
     }
 
 
@@ -330,14 +375,14 @@ def median_geometry(items: list[dict[str, float] | None]) -> dict[str, float] | 
     if not valid:
         return None
     keys = (
-        "angolo_gomito_deg",
-        "angolo_racchetta_busto_deg",
-        "distanza_spalla_gomito",
-        "distanza_gomito_polso",
-        "distanza_polso_racchetta",
-        "distanza_spalla_racchetta",
-        "lato_contatto",
-        "visibilita_polso",
+        "elbow_angle_deg",
+        "racket_torso_angle_deg",
+        "shoulder_elbow_distance",
+        "elbow_wrist_distance",
+        "wrist_racket_distance",
+        "shoulder_racket_distance",
+        "contact_side",
+        "wrist_visibility",
     )
     merged: dict[str, float] = {}
     for key in keys:
@@ -362,7 +407,7 @@ def crosses_center(rows: list[dict[str, str]], indexes: list[int], scale_y: floa
     if len(signs) < 2:
         return "no"
     if min(signs) < 0 < max(signs):
-        return "sì"
+        return "yes"
     return "no"
 
 
@@ -385,7 +430,11 @@ def direction_degrees(
 
 
 def build_strokes(
-    rows: list[dict[str, str]], scale_y: float, fps: float
+    rows: list[dict[str, str]],
+    scale_y: float,
+    fps: float,
+    dominant_arm: str,
+    backhand_preference: str | None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     times = [float(row["time_s"]) for row in rows]
     series = wrist_speeds(rows, scale_y, fps)
@@ -409,7 +458,7 @@ def build_strokes(
             if series[index].get(f"{arm}_step", 0.0) <= JUMP_TORSO
         ]
         pool = stable or usable
-        contact = max(pool, key=lambda index: (series[index]["liscia"], -abs(index - peak)))
+        contact = max(pool, key=lambda index: (series[index]["smooth"], -abs(index - peak)))
         nearby = [index for index in pool if abs(index - contact) <= 2]
         geometry = median_geometry([arm_geometry(rows[index], scale_y, arm) for index in nearby])
         if geometry is None:
@@ -420,50 +469,57 @@ def build_strokes(
         jump = any(
             series[index].get(f"{arm}_step", 0.0) > JUMP_TORSO for index in indexes
         ) or not stable
+        both_arms = both_arms_visible(rows, indexes)
+        kind = stroke_type_for(arm, dominant_arm)
+        style = ""
+        if kind == "backhand":
+            style = backhand_style_for(both_arms, backhand_preference)
         stroke = {
-            "colpo": str(stroke_id),
-            "braccio": arm,
-            "t_inizio": f"{times[start]:.3f}",
-            "t_contatto": f"{times[contact]:.3f}",
-            "t_fine": f"{times[end]:.3f}",
-            "angolo_gomito_deg": f"{geometry['angolo_gomito_deg']:.0f}",
-            "angolo_racchetta_busto_deg": f"{geometry['angolo_racchetta_busto_deg']:.0f}",
-            "velocita_polso": f"{series[contact]['liscia']:.1f}",
-            "distanza_spalla_gomito": f"{geometry['distanza_spalla_gomito']:.2f}",
-            "distanza_gomito_polso": f"{geometry['distanza_gomito_polso']:.2f}",
-            "distanza_polso_racchetta": f"{geometry['distanza_polso_racchetta']:.2f}",
-            "distanza_spalla_racchetta": f"{geometry['distanza_spalla_racchetta']:.2f}",
-            "direzione_oscillazione_deg": "" if swing is None else f"{swing:.0f}",
-            "rotazione_spalle_deg": "" if shoulders is None else f"{shoulders:.0f}",
-            "rotazione_anche_deg": "" if hips is None else f"{hips:.0f}",
-            "lato_contatto": f"{geometry['lato_contatto']:.2f}",
-            "attraversa_centro": crosses_center(rows, indexes, scale_y, arm),
-            "angolo_ginocchio_sx_deg": format_knee(rows, nearby, scale_y, "l"),
-            "angolo_ginocchio_dx_deg": format_knee(rows, nearby, scale_y, "r"),
-            "da_controllare": "sì" if jump else "no",
+            "shot": str(stroke_id),
+            "striking_arm": arm,
+            "stroke_type": kind,
+            "backhand_style": style,
+            "t_start": f"{times[start]:.3f}",
+            "t_contact": f"{times[contact]:.3f}",
+            "t_end": f"{times[end]:.3f}",
+            "elbow_angle_deg": f"{geometry['elbow_angle_deg']:.0f}",
+            "racket_torso_angle_deg": f"{geometry['racket_torso_angle_deg']:.0f}",
+            "wrist_speed": f"{series[contact]['smooth']:.1f}",
+            "shoulder_elbow_distance": f"{geometry['shoulder_elbow_distance']:.2f}",
+            "elbow_wrist_distance": f"{geometry['elbow_wrist_distance']:.2f}",
+            "wrist_racket_distance": f"{geometry['wrist_racket_distance']:.2f}",
+            "shoulder_racket_distance": f"{geometry['shoulder_racket_distance']:.2f}",
+            "swing_direction_deg": "" if swing is None else f"{swing:.0f}",
+            "shoulder_rotation_deg": "" if shoulders is None else f"{shoulders:.0f}",
+            "hip_rotation_deg": "" if hips is None else f"{hips:.0f}",
+            "contact_side": f"{geometry['contact_side']:.2f}",
+            "crosses_center": crosses_center(rows, indexes, scale_y, arm),
+            "left_knee_angle_deg": format_knee(rows, nearby, scale_y, "l"),
+            "right_knee_angle_deg": format_knee(rows, nearby, scale_y, "r"),
+            "needs_review": "yes" if jump else "no",
         }
         strokes.append(stroke)
         for index in indexes:
             frame_geometry = arm_geometry(rows[index], scale_y, arm)
             frames.append(
                 {
-                    "colpo": str(stroke_id),
+                    "shot": str(stroke_id),
                     "frame": rows[index]["frame"],
                     "time_s": f"{times[index]:.3f}",
-                    "braccio": arm,
-                    "angolo_gomito_deg": ""
+                    "striking_arm": arm,
+                    "elbow_angle_deg": ""
                     if frame_geometry is None
-                    else f"{frame_geometry['angolo_gomito_deg']:.0f}",
-                    "angolo_racchetta_busto_deg": ""
+                    else f"{frame_geometry['elbow_angle_deg']:.0f}",
+                    "racket_torso_angle_deg": ""
                     if frame_geometry is None
-                    else f"{frame_geometry['angolo_racchetta_busto_deg']:.0f}",
-                    "velocita_polso": f"{series[index]['liscia']:.1f}",
-                    "visibilita_polso": ""
+                    else f"{frame_geometry['racket_torso_angle_deg']:.0f}",
+                    "wrist_speed": f"{series[index]['smooth']:.1f}",
+                    "wrist_visibility": ""
                     if frame_geometry is None
-                    else f"{frame_geometry['visibilita_polso']:.2f}",
-                    "angolo_ginocchio_sx_deg": format_knee(rows, [index], scale_y, "l"),
-                    "angolo_ginocchio_dx_deg": format_knee(rows, [index], scale_y, "r"),
-                    "salto": "sì" if series[index].get(f"{arm}_step", 0.0) > JUMP_TORSO else "no",
+                    else f"{frame_geometry['wrist_visibility']:.2f}",
+                    "left_knee_angle_deg": format_knee(rows, [index], scale_y, "l"),
+                    "right_knee_angle_deg": format_knee(rows, [index], scale_y, "r"),
+                    "jump": "yes" if series[index].get(f"{arm}_step", 0.0) > JUMP_TORSO else "no",
                 }
             )
     return strokes, frames
@@ -479,54 +535,61 @@ def write_csv(path: Path, fields: list[str], rows: list[dict[str, str]]) -> None
 
 def direction_phrase(raw: str) -> str:
     if raw == "":
-        return "direzione non misurata"
+        return "direction not measured"
     degrees = float(raw)
     if abs(degrees) > 135:
-        horizontal = "verso sinistra"
+        horizontal = "to the left"
     elif abs(degrees) <= 45:
-        horizontal = "verso destra"
+        horizontal = "to the right"
     else:
         horizontal = ""
     if degrees < -25:
-        vertical = "e verso l'alto"
+        vertical = "and upward"
     elif degrees > 25:
-        vertical = "e verso il basso"
+        vertical = "and downward"
     else:
         vertical = ""
-    return " ".join(part for part in (horizontal, vertical) if part) or "quasi in asse"
+    return " ".join(part for part in (horizontal, vertical) if part) or "nearly along the axis"
 
 
 def print_summary(strokes: list[dict[str, str]]) -> None:
     print()
     if not strokes:
-        print("Nessun colpo sopra la soglia di velocità del polso.")
+        print("No stroke above the wrist-speed threshold.")
         return
-    print(f"Colpi trovati: {len(strokes)}")
-    print("Distanze in lunghezze del busto. Velocità in busti al secondo.")
-    print("0° di oscillazione è verso destra dell'immagine, negativo è verso l'alto.")
-    print("La punta della racchetta è il prolungamento dell'avambraccio, non un punto visto.")
+    forehands = sum(1 for stroke in strokes if stroke["stroke_type"] == "forehand")
+    backhands = len(strokes) - forehands
+    one_handed = sum(1 for stroke in strokes if stroke["backhand_style"] == "one-handed")
+    two_handed = sum(1 for stroke in strokes if stroke["backhand_style"] == "two-handed")
+    print(f"Strokes found: {len(strokes)}")
+    print(f"Forehands: {forehands}. Backhands: {backhands} (one-handed {one_handed}, two-handed {two_handed}).")
+    print("Distances are in torso lengths. Speed is in torso lengths per second.")
+    print("0° of swing points to the right of the image. Negative is upward.")
+    print("The racket tip is the forearm extended past the wrist, not a seen point.")
     print()
     for stroke in strokes:
-        check = " Da controllare: un frame del polso salta." if stroke["da_controllare"] == "sì" else ""
+        check = " Needs review: a wrist frame jumped." if stroke["needs_review"] == "yes" else ""
+        style = f", {stroke['backhand_style']} backhand" if stroke["backhand_style"] else ""
         print(
-            f"Colpo {stroke['colpo']}, braccio {stroke['braccio']}, "
-            f"contatto a {stroke['t_contatto']}s "
-            f"({stroke['t_inizio']}–{stroke['t_fine']})."
+            f"Shot {stroke['shot']}, {stroke['stroke_type']}{style}, "
+            f"{stroke['striking_arm']} arm, "
+            f"contact at {stroke['t_contact']}s "
+            f"({stroke['t_start']}–{stroke['t_end']})."
         )
         print(
-            f"  Gomito {stroke['angolo_gomito_deg']}°. "
-            f"Racchetta-busto {stroke['angolo_racchetta_busto_deg']}°. "
-            f"Velocità {stroke['velocita_polso']}."
+            f"  Elbow {stroke['elbow_angle_deg']}°. "
+            f"Racket-torso {stroke['racket_torso_angle_deg']}°. "
+            f"Speed {stroke['wrist_speed']}."
         )
         print(
-            f"  Oscillazione {direction_phrase(stroke['direzione_oscillazione_deg'])}. "
-            f"Spalle {stroke['rotazione_spalle_deg'] or 'n/d'}°, "
-            f"anche {stroke['rotazione_anche_deg'] or 'n/d'}°.{check}"
+            f"  Swing {direction_phrase(stroke['swing_direction_deg'])}. "
+            f"Shoulders {stroke['shoulder_rotation_deg'] or 'n/a'}°, "
+            f"hips {stroke['hip_rotation_deg'] or 'n/a'}°.{check}"
         )
         print(
-            "  Ginocchio, 180° è la gamba distesa: "
-            f"sinistro {stroke['angolo_ginocchio_sx_deg'] or 'n/d'} gradi, "
-            f"destro {stroke['angolo_ginocchio_dx_deg'] or 'n/d'} gradi."
+            "  Knee, 180° is a straight leg: "
+            f"left {stroke['left_knee_angle_deg'] or 'n/a'} degrees, "
+            f"right {stroke['right_knee_angle_deg'] or 'n/a'} degrees."
         )
 
 
@@ -541,7 +604,7 @@ def draw_overlay(
     import cv2
 
     windows: list[tuple[float, float, dict[str, str]]] = [
-        (float(stroke["t_inizio"]), float(stroke["t_fine"]), stroke) for stroke in strokes
+        (float(stroke["t_start"]), float(stroke["t_end"]), stroke) for stroke in strokes
     ]
     capture = cv2.VideoCapture(str(video_path))
     fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
@@ -559,11 +622,11 @@ def draw_overlay(
         candidate.release()
     if writer is None:
         capture.release()
-        print("Non riesco a scrivere il video delle feature.", file=sys.stderr)
+        print("Could not write the features video.", file=sys.stderr)
         return
 
     jumped = {
-        int(row["frame"]): row["salto"] == "sì" for row in frame_rows if row["frame"] != ""
+        int(row["frame"]): row["jump"] == "yes" for row in frame_rows if row["frame"] != ""
     }
 
     def to_pixel(x: float, y_scaled: float) -> tuple[int, int]:
@@ -580,7 +643,7 @@ def draw_overlay(
         if active is not None and jumped.get(frame_index, False):
             cv2.putText(
                 frame,
-                f"colpo {active['colpo']}  polso incerto",
+                f"shot {active['shot']}  uncertain wrist",
                 (16, 36),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -589,19 +652,23 @@ def draw_overlay(
                 cv2.LINE_AA,
             )
         elif active is not None:
-            geometry = arm_geometry(row, scale_y, active["braccio"])
+            geometry = arm_geometry(row, scale_y, active["striking_arm"])
             if geometry is not None:
-                elbow = to_pixel(geometry["gomito_x"], geometry["gomito_y"])
-                wrist = to_pixel(geometry["polso_x"], geometry["polso_y"])
-                tip = to_pixel(geometry["punta_x"], geometry["punta_y"])
+                elbow = to_pixel(geometry["elbow_x"], geometry["elbow_y"])
+                wrist = to_pixel(geometry["wrist_x"], geometry["wrist_y"])
+                tip = to_pixel(geometry["tip_x"], geometry["tip_y"])
                 cv2.line(frame, elbow, wrist, (0, 220, 255), 3)
                 cv2.line(frame, wrist, tip, (0, 220, 255), 2)
                 cv2.circle(frame, tip, 6, (0, 220, 255), -1)
+                label = active["stroke_type"]
+                if active["backhand_style"]:
+                    label = f"{active['backhand_style']} {label}"
                 cv2.putText(
                     frame,
                     (
-                        f"colpo {active['colpo']}  gomito {geometry['angolo_gomito_deg']:.0f}"
-                        f"  racchetta {geometry['angolo_racchetta_busto_deg']:.0f}"
+                        f"shot {active['shot']}  {label}"
+                        f"  elbow {geometry['elbow_angle_deg']:.0f}"
+                        f"  racket {geometry['racket_torso_angle_deg']:.0f}"
                     ),
                     (16, 36),
                     cv2.FONT_HERSHEY_SIMPLEX,
@@ -614,7 +681,7 @@ def draw_overlay(
         frame_index += 1
     capture.release()
     writer.release()
-    print(f"Video con racchetta stimata: {destination}")
+    print(f"Estimated racket video: {destination}")
 
 
 def default_video(csv_path: Path) -> Path | None:
@@ -627,33 +694,48 @@ def default_video(csv_path: Path) -> Path | None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Estrae le feature dei colpi da un CSV di pose.")
-    parser.add_argument("csv", type=Path, help="CSV scritto da try_mediapipe.py")
-    parser.add_argument("--video", type=Path, default=None, help="Video originale, per scala e overlay")
-    parser.add_argument("--output", type=Path, default=ROOT / "output", help="Cartella dei risultati")
+    parser = argparse.ArgumentParser(description="Extract stroke features from a pose CSV.")
+    parser.add_argument("csv", type=Path, help="CSV written by try_mediapipe.py")
+    parser.add_argument("--video", type=Path, default=None, help="Original video, for scale and overlay")
+    parser.add_argument("--output", type=Path, default=ROOT / "output", help="Folder for the results")
+    parser.add_argument(
+        "--dominant-arm",
+        choices=("left", "right"),
+        default="right",
+        help="Registered dominant arm. A stroke with that arm is a forehand.",
+    )
+    parser.add_argument(
+        "--backhand",
+        choices=("one-handed", "two-handed"),
+        default=None,
+        help="Profile backhand. Used when both arms do not swing together.",
+    )
     args = parser.parse_args()
     csv_path = args.csv.expanduser().resolve()
     if not csv_path.is_file():
-        print(f"CSV non trovato: {csv_path}", file=sys.stderr)
+        print(f"CSV not found: {csv_path}", file=sys.stderr)
         return 1
     video_path = args.video.expanduser().resolve() if args.video else default_video(csv_path)
     if video_path is None or not video_path.is_file():
-        print("Serve il video originale per conoscere larghezza e altezza.", file=sys.stderr)
-        print("Esempio: python extract_features.py output/sample_keypoints.csv --video videos/sample.mov", file=sys.stderr)
+        print("The original video is required for width and height.", file=sys.stderr)
+        print(
+            "Example: python extract_features.py output/sample_keypoints.csv --video videos/sample.mov",
+            file=sys.stderr,
+        )
         return 1
 
     width, height, fps = video_geometry(video_path)
     scale_y = height / width
     rows = load_rows(csv_path)
-    strokes, frames = build_strokes(rows, scale_y, fps)
+    strokes, frames = build_strokes(rows, scale_y, fps, args.dominant_arm, args.backhand)
     stem = csv_path.name.replace("_keypoints.csv", "")
     output_dir = args.output.resolve()
     strokes_path = output_dir / f"{stem}_strokes.csv"
     frames_path = output_dir / f"{stem}_stroke_frames.csv"
     write_csv(strokes_path, STROKE_FIELDS, strokes)
     write_csv(frames_path, FRAME_FIELDS, frames)
-    print(f"Tabella colpi: {strokes_path}")
-    print(f"Frame dei colpi: {frames_path}")
+    print(f"Stroke table: {strokes_path}")
+    print(f"Stroke frames: {frames_path}")
     draw_overlay(
         video_path,
         rows,

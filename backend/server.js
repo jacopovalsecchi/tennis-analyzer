@@ -2,12 +2,136 @@ const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+
+const execFileAsync = promisify(execFile);
 
 const PORT = Number(process.env.PORT) || 3001;
+const projectRoot = path.join(__dirname, '..');
 const uploadDir = path.join(__dirname, 'uploads');
+const resultsDir = path.join(__dirname, 'results');
 const videoExtensions = new Set(['.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm']);
+const venvPython = path.join(projectRoot, '.venv', 'bin', 'python');
+const python = fs.existsSync(venvPython) ? venvPython : 'python3';
+const ANALYSIS_TIMEOUT_MS = 15 * 60 * 1000;
 
 fs.mkdirSync(uploadDir, { recursive: true });
+fs.mkdirSync(resultsDir, { recursive: true });
+
+function formChoice(value, allowed, fallback) {
+  if (typeof value !== 'string') {
+    return fallback;
+  }
+  const normalized = value.trim().toLowerCase();
+  return allowed.includes(normalized) ? normalized : fallback;
+}
+
+function readStrokes(csvPath) {
+  const lines = fs.readFileSync(csvPath, 'utf8').trim().split('\n');
+  const columns = lines[0].split(',');
+  return lines.slice(1).filter(line => line.trim()).map(line => {
+    const cells = line.split(',');
+    return Object.fromEntries(columns.map((column, index) => [column, cells[index] ?? '']));
+  });
+}
+
+function countStrokes(strokes) {
+  const counts = { shots: strokes.length, forehands: 0, backhands: 0, oneHanded: 0, twoHanded: 0 };
+  for (const stroke of strokes) {
+    if (stroke.stroke_type === 'forehand') {
+      counts.forehands += 1;
+    } else if (stroke.stroke_type === 'backhand') {
+      counts.backhands += 1;
+      if (stroke.backhand_style === 'two-handed') {
+        counts.twoHanded += 1;
+      } else {
+        counts.oneHanded += 1;
+      }
+    }
+  }
+  return counts;
+}
+
+function logBlock(title, text) {
+  const body = (text || '').trim();
+  console.log(`--- ${title} ---`);
+  if (body) {
+    console.log(body);
+  }
+}
+
+function logResults(videoName, options, analysis) {
+  console.log('--- Analysis complete ---');
+  console.log(`Video: ${videoName}`);
+  console.log(`Dominant arm: ${options.dominantArm}`);
+  console.log(`Backhand preference: ${options.backhand || 'not set'}`);
+  console.log(`Status: ${analysis.status}`);
+  console.log(
+    `Shots: ${analysis.counts.shots} ` +
+      `(forehands ${analysis.counts.forehands}, ` +
+      `backhands ${analysis.counts.backhands}, ` +
+      `one-handed ${analysis.counts.oneHanded}, ` +
+      `two-handed ${analysis.counts.twoHanded})`,
+  );
+  for (const stroke of analysis.strokes) {
+    const style = stroke.backhand_style ? ` ${stroke.backhand_style}` : '';
+    console.log(
+      `  Shot ${stroke.shot}: ${stroke.stroke_type}${style}, ` +
+        `${stroke.striking_arm} arm, ` +
+        `contact ${stroke.t_contact}s, ` +
+        `elbow ${stroke.elbow_angle_deg}°, ` +
+        `racket-torso ${stroke.racket_torso_angle_deg}°, ` +
+        `wrist speed ${stroke.wrist_speed}`,
+    );
+  }
+  console.log(`Overlay: ${analysis.overlay}`);
+  console.log(`Strokes CSV: ${analysis.strokesCsv}`);
+  console.log(`Features video: ${analysis.features}`);
+}
+
+async function runAnalysis(videoPath, options) {
+  const stem = path.basename(videoPath, path.extname(videoPath));
+  const outputDir = path.join(resultsDir, stem);
+  fs.mkdirSync(outputDir, { recursive: true });
+  const run = async (script, args) => {
+    console.log(`Status: running ${script}`);
+    const result = await execFileAsync(python, [path.join(projectRoot, script), ...args], {
+      cwd: projectRoot,
+      timeout: ANALYSIS_TIMEOUT_MS,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    logBlock(script, `${result.stdout || ''}${result.stderr || ''}`);
+    return result;
+  };
+
+  await run('try_mediapipe.py', [videoPath, '--output', outputDir]);
+  const strokesCsv = path.join(outputDir, `${stem}_strokes.csv`);
+  const featureArgs = [
+    path.join(outputDir, `${stem}_keypoints.csv`),
+    '--video',
+    videoPath,
+    '--output',
+    outputDir,
+    '--dominant-arm',
+    options.dominantArm,
+  ];
+  if (options.backhand) {
+    featureArgs.push('--backhand', options.backhand);
+  }
+  await run('extract_features.py', featureArgs);
+
+  const strokes = readStrokes(strokesCsv);
+  return {
+    status: 'complete',
+    outputDir,
+    overlay: path.join(outputDir, `${stem}_overlay.mp4`),
+    strokesCsv,
+    features: path.join(outputDir, `${stem}_features.mp4`),
+    strokes,
+    counts: countStrokes(strokes),
+  };
+}
 
 const storage = multer.diskStorage({
   destination: (_req, _file, callback) => {
@@ -39,22 +163,87 @@ const upload = multer({
 
 const app = express();
 
+const latestFile = path.join(resultsDir, 'latest.json');
+
+function readLatest() {
+  if (!fs.existsSync(latestFile)) {
+    return null;
+  }
+  return JSON.parse(fs.readFileSync(latestFile, 'utf8'));
+}
+
+function saveLatest(record) {
+  fs.writeFileSync(latestFile, JSON.stringify(record));
+}
+
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/upload', upload.single('video'), (req, res) => {
+app.get('/results/latest', (_req, res) => {
+  const latest = readLatest();
+  if (!latest) {
+    res.status(404).json({ error: 'No results yet' });
+    return;
+  }
+  res.json({
+    filename: latest.filename,
+    storedAs: latest.storedAs,
+    uploadedAt: latest.uploadedAt,
+    strokes: latest.strokes,
+  });
+});
+
+app.get('/results/latest/overlay', (_req, res) => {
+  const latest = readLatest();
+  if (!latest?.overlay || !fs.existsSync(latest.overlay)) {
+    res.status(404).json({ error: 'Overlay not found' });
+    return;
+  }
+  res.sendFile(path.resolve(latest.overlay));
+});
+
+app.post('/upload', upload.single('video'), async (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: 'Missing video file' });
     return;
   }
-  console.log('Uploaded:', req.file.originalname);
-  res.status(201).json({
-    status: 'uploaded',
-    filename: req.file.originalname,
-    storedAs: req.file.filename,
-    size: req.file.size,
-  });
+  const dominantArm = formChoice(req.body.dominantArm, ['left', 'right'], 'right');
+  const backhand = formChoice(req.body.backhand, ['one-handed', 'two-handed'], null);
+  console.log('--- Upload ---');
+  console.log(`Video: ${req.file.originalname}`);
+  console.log(`Stored as: ${req.file.path}`);
+  console.log(`Dominant arm: ${dominantArm}`);
+  console.log(`Backhand preference: ${backhand || 'not set'}`);
+  console.log('Status: analysis started');
+  try {
+    const analysis = await runAnalysis(req.file.path, { dominantArm, backhand });
+    logResults(req.file.originalname, { dominantArm, backhand }, analysis);
+    const uploadedAt = new Date().toISOString();
+    saveLatest({
+      filename: req.file.originalname,
+      storedAs: req.file.filename,
+      uploadedAt,
+      strokes: analysis.counts,
+      overlay: analysis.overlay,
+    });
+    res.status(201).json({
+      status: 'processed',
+      filename: req.file.originalname,
+      storedAs: req.file.filename,
+      size: req.file.size,
+      uploadedAt,
+      dominantArm,
+      backhand,
+      strokes: analysis.counts,
+      overlay: analysis.overlay,
+      strokesCsv: analysis.strokesCsv,
+    });
+  } catch (error) {
+    console.error('--- Analysis failed ---');
+    console.error(error.stderr || error.stdout || error.message);
+    res.status(500).json({ error: 'Video analysis failed' });
+  }
 });
 
 app.use((error, _req, res, _next) => {
