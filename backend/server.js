@@ -14,6 +14,7 @@ const resultsDir = path.join(__dirname, 'results');
 const videoExtensions = new Set(['.mp4', '.mov', '.m4v', '.avi', '.mkv', '.webm']);
 const venvPython = path.join(projectRoot, '.venv', 'bin', 'python');
 const python = fs.existsSync(venvPython) ? venvPython : 'python3';
+const ffprobe = process.env.FFPROBE || 'ffprobe';
 const ANALYSIS_TIMEOUT_MS = 15 * 60 * 1000;
 
 fs.mkdirSync(uploadDir, { recursive: true });
@@ -53,6 +54,23 @@ function countStrokes(strokes) {
   return counts;
 }
 
+async function getVideoDuration(videoPath) {
+  const { stdout } = await execFileAsync(ffprobe, [
+    '-v',
+    'error',
+    '-show_entries',
+    'format=duration',
+    '-of',
+    'default=noprint_wrappers=1:nokey=1',
+    videoPath,
+  ]);
+  const duration = Number.parseFloat(stdout.trim());
+  if (!Number.isFinite(duration)) {
+    throw new Error('Unable to determine video duration');
+  }
+  return duration;
+}
+
 function logBlock(title, text) {
   const body = (text || '').trim();
   console.log(`--- ${title} ---`);
@@ -88,12 +106,16 @@ function logResults(videoName, options, analysis) {
   console.log(`Overlay: ${analysis.overlay}`);
   console.log(`Strokes CSV: ${analysis.strokesCsv}`);
   console.log(`Features video: ${analysis.features}`);
+  for (const shot of analysis.comments) {
+    console.log(`  ${shot.time}s ${shot.label}: ${shot.comment}`);
+  }
 }
 
 async function runAnalysis(videoPath, options) {
   const stem = path.basename(videoPath, path.extname(videoPath));
   const outputDir = path.join(resultsDir, stem);
   fs.mkdirSync(outputDir, { recursive: true });
+  const duration = await getVideoDuration(videoPath);
   const run = async (script, args) => {
     console.log(`Status: running ${script}`);
     const result = await execFileAsync(python, [path.join(projectRoot, script), ...args], {
@@ -120,16 +142,28 @@ async function runAnalysis(videoPath, options) {
     featureArgs.push('--backhand', options.backhand);
   }
   await run('extract_features.py', featureArgs);
+  const commentsPath = path.join(outputDir, `${stem}_comments.json`);
+  await run('comment_strokes.py', [
+    path.join(outputDir, `${stem}_keypoints.csv`),
+    strokesCsv,
+    '--video',
+    videoPath,
+    '--output',
+    commentsPath,
+  ]);
 
   const strokes = readStrokes(strokesCsv);
+  const comments = JSON.parse(fs.readFileSync(commentsPath, 'utf8')).comments ?? [];
   return {
     status: 'complete',
+    duration,
     outputDir,
     overlay: path.join(outputDir, `${stem}_overlay.mp4`),
     strokesCsv,
     features: path.join(outputDir, `${stem}_features.mp4`),
     strokes,
     counts: countStrokes(strokes),
+    comments,
   };
 }
 
@@ -176,6 +210,20 @@ function saveLatest(record) {
   fs.writeFileSync(latestFile, JSON.stringify(record));
 }
 
+function commentsForClient(comments) {
+  return (comments ?? []).map(shot => {
+    const image = shot.image ? path.basename(shot.image) : null;
+    return {
+      time: shot.time,
+      frame: shot.frame ?? null,
+      label: shot.label,
+      arm: shot.arm,
+      comment: shot.comment,
+      imageUrl: image ? `/results/latest/frames/${image}` : null,
+    };
+  });
+}
+
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
@@ -190,8 +238,22 @@ app.get('/results/latest', (_req, res) => {
     filename: latest.filename,
     storedAs: latest.storedAs,
     uploadedAt: latest.uploadedAt,
+    duration: latest.duration,
     strokes: latest.strokes,
+    comments: commentsForClient(latest.comments),
   });
+});
+
+app.get('/results/latest/frames/:name', (req, res) => {
+  const latest = readLatest();
+  const image = path.basename(req.params.name);
+  const framesDir = latest?.overlay ? path.join(path.dirname(latest.overlay), 'comment_frames') : null;
+  const file = framesDir ? path.join(framesDir, image) : null;
+  if (!image.endsWith('.jpg') || !file || !fs.existsSync(file)) {
+    res.status(404).json({ error: 'Frame not found' });
+    return;
+  }
+  res.sendFile(path.resolve(file));
 });
 
 app.get('/results/latest/overlay', (_req, res) => {
@@ -224,18 +286,23 @@ app.post('/upload', upload.single('video'), async (req, res) => {
       filename: req.file.originalname,
       storedAs: req.file.filename,
       uploadedAt,
+      duration: analysis.duration,
       strokes: analysis.counts,
+      comments: analysis.comments,
       overlay: analysis.overlay,
     });
+    const comments = commentsForClient(analysis.comments);
     res.status(201).json({
       status: 'processed',
       filename: req.file.originalname,
       storedAs: req.file.filename,
       size: req.file.size,
       uploadedAt,
+      duration: analysis.duration,
       dominantArm,
       backhand,
       strokes: analysis.counts,
+      comments,
       overlay: analysis.overlay,
       strokesCsv: analysis.strokesCsv,
     });
