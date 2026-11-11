@@ -16,6 +16,12 @@ const venvPython = path.join(projectRoot, '.venv', 'bin', 'python');
 const python = fs.existsSync(venvPython) ? venvPython : 'python3';
 const ffprobe = process.env.FFPROBE || 'ffprobe';
 const ANALYSIS_TIMEOUT_MS = 15 * 60 * 1000;
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const authRequired = process.env.SUPABASE_AUTH_REQUIRED === 'true';
+const supabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
+const persistenceConfigured = Boolean(supabaseUrl && supabaseServiceRoleKey);
 
 fs.mkdirSync(uploadDir, { recursive: true });
 fs.mkdirSync(resultsDir, { recursive: true });
@@ -197,6 +203,150 @@ const upload = multer({
 
 const app = express();
 
+async function supabaseRest(resource, options = {}, key = supabaseServiceRoleKey) {
+  if (!supabaseUrl || !key) {
+    throw new Error('Supabase persistence is not configured');
+  }
+  const response = await fetch(`${supabaseUrl}/rest/v1/${resource}`, {
+    ...options,
+    headers: {
+      apikey: key,
+      Authorization: `Bearer ${key}`,
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  });
+  const body = await response.text();
+  let parsed = null;
+  if (body) {
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      parsed = body;
+    }
+  }
+  if (!response.ok) {
+    throw new Error(parsed?.message || parsed?.hint || parsed || `Supabase request failed (${response.status})`);
+  }
+  return parsed;
+}
+
+async function authenticate(req, res, next) {
+  const authorization = req.get('authorization') || '';
+  const token = authorization.startsWith('Bearer ')
+    ? authorization.slice('Bearer '.length).trim()
+    : null;
+
+  if (!token) {
+    if (authRequired) {
+      res.status(401).json({ error: 'Authentication required' });
+      return;
+    }
+    req.user = null;
+    next();
+    return;
+  }
+
+  if (!supabaseConfigured) {
+    res.status(503).json({ error: 'Supabase authentication is not configured' });
+    return;
+  }
+
+  try {
+    const response = await fetch(`${supabaseUrl}/auth/v1/user`, {
+      headers: {
+        apikey: supabaseAnonKey,
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    const user = response.ok ? await response.json() : null;
+    if (!user?.id) {
+      throw new Error('Invalid authentication token');
+    }
+    req.user = user;
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid authentication token' });
+  }
+}
+
+async function getProfile(user) {
+  if (!user || !persistenceConfigured) {
+    return null;
+  }
+
+  const data = await supabaseRest(
+    'profiles?on_conflict=id',
+    {
+      method: 'POST',
+      headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
+      body: JSON.stringify({
+        id: user.id,
+        display_name: user.user_metadata?.full_name || user.user_metadata?.name || null,
+        avatar_url: user.user_metadata?.avatar_url || user.user_metadata?.picture || null,
+      }),
+    },
+  );
+  return data?.[0] || null;
+}
+
+async function createAnalysisJob(user, values) {
+  if (!user || !persistenceConfigured) {
+    return null;
+  }
+
+  const data = await supabaseRest('analysis_jobs', {
+    method: 'POST',
+    headers: { Prefer: 'return=representation' },
+    body: JSON.stringify({
+      user_id: user.id,
+      original_filename: values.originalFilename,
+      stored_filename: values.storedFilename,
+      dominant_arm: values.dominantArm,
+      backhand: values.backhand,
+      status: 'processing',
+    }),
+  });
+  return data?.[0]?.id || null;
+}
+
+async function saveAnalysisResult(jobId, analysis) {
+  if (!jobId || !persistenceConfigured) {
+    return;
+  }
+
+  await supabaseRest('analysis_results?on_conflict=job_id', {
+    method: 'POST',
+    headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify({
+      job_id: jobId,
+      duration_seconds: analysis.duration,
+      strokes: analysis.strokes,
+      counts: analysis.counts,
+      comments: analysis.comments,
+      overlay_path: analysis.overlay,
+      strokes_csv_path: analysis.strokesCsv,
+      features_path: analysis.features,
+    }),
+  });
+  await supabaseRest(`analysis_jobs?id=eq.${encodeURIComponent(jobId)}`, {
+    method: 'PATCH',
+    headers: { Prefer: 'return=minimal' },
+    body: JSON.stringify({ status: 'complete', completed_at: new Date().toISOString() }),
+  });
+}
+
+async function failAnalysisJob(jobId, message) {
+  if (!jobId || !persistenceConfigured) {
+    return;
+  }
+  await supabaseRest(`analysis_jobs?id=eq.${encodeURIComponent(jobId)}`, {
+    method: 'PATCH',
+    headers: { Prefer: 'return=minimal' },
+    body: JSON.stringify({ status: 'failed', error_message: message }),
+  });
+}
+
 const latestFile = path.join(resultsDir, 'latest.json');
 
 function readLatest() {
@@ -225,8 +375,14 @@ function commentsForClient(comments) {
 }
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    authConfigured: supabaseConfigured,
+    persistenceConfigured,
+  });
 });
+
+app.use(authenticate);
 
 app.get('/results/latest', (_req, res) => {
   const latest = readLatest();
@@ -265,22 +421,88 @@ app.get('/results/latest/overlay', (_req, res) => {
   res.sendFile(path.resolve(latest.overlay));
 });
 
+app.get('/jobs', async (req, res) => {
+  if (!req.user || !persistenceConfigured) {
+    res.status(503).json({ error: 'Authenticated persistence is not configured' });
+    return;
+  }
+
+  try {
+    const data = await supabaseRest(
+      `analysis_jobs?user_id=eq.${encodeURIComponent(req.user.id)}`
+        + '&select=id,original_filename,dominant_arm,backhand,status,error_message,created_at,completed_at'
+        + '&order=created_at.desc',
+    );
+    res.json({ jobs: data });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
+});
+
+app.get('/jobs/:id', async (req, res) => {
+  if (!req.user || !persistenceConfigured) {
+    res.status(503).json({ error: 'Authenticated persistence is not configured' });
+    return;
+  }
+
+  try {
+    const data = await supabaseRest(
+      `analysis_jobs?id=eq.${encodeURIComponent(req.params.id)}`
+        + `&user_id=eq.${encodeURIComponent(req.user.id)}`
+        + '&select=id,original_filename,dominant_arm,backhand,status,error_message,created_at,completed_at,analysis_results(*)',
+    );
+    const job = data?.[0];
+    if (!job) {
+      res.status(404).json({ error: 'Job not found' });
+      return;
+    }
+    res.json({ job });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
+});
+
 app.post('/upload', upload.single('video'), async (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: 'Missing video file' });
     return;
   }
-  const dominantArm = formChoice(req.body.dominantArm, ['left', 'right'], 'right');
-  const backhand = formChoice(req.body.backhand, ['one-handed', 'two-handed'], null);
-  console.log('--- Upload ---');
-  console.log(`Video: ${req.file.originalname}`);
-  console.log(`Stored as: ${req.file.path}`);
-  console.log(`Dominant arm: ${dominantArm}`);
-  console.log(`Backhand preference: ${backhand || 'not set'}`);
-  console.log('Status: analysis started');
+  let profile;
   try {
+    profile = await getProfile(req.user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+    return;
+  }
+  const dominantArm = formChoice(
+    req.body.dominantArm,
+    ['left', 'right'],
+    profile?.handedness || 'right',
+  );
+  const backhand = formChoice(
+    req.body.backhand,
+    ['one-handed', 'two-handed'],
+    profile?.backhand_style || null,
+  );
+  let jobId;
+  try {
+    console.log('--- Upload ---');
+    console.log(`Video: ${req.file.originalname}`);
+    console.log(`Stored as: ${req.file.path}`);
+    console.log(`Dominant arm: ${dominantArm}`);
+    console.log(`Backhand preference: ${backhand || 'not set'}`);
+    console.log('Status: analysis started');
+    jobId = await createAnalysisJob(req.user, {
+      originalFilename: req.file.originalname,
+      storedFilename: req.file.filename,
+      dominantArm,
+      backhand,
+    });
     const analysis = await runAnalysis(req.file.path, { dominantArm, backhand });
     logResults(req.file.originalname, { dominantArm, backhand }, analysis);
+    await saveAnalysisResult(jobId, analysis);
     const uploadedAt = new Date().toISOString();
     saveLatest({
       filename: req.file.originalname,
@@ -294,6 +516,7 @@ app.post('/upload', upload.single('video'), async (req, res) => {
     const comments = commentsForClient(analysis.comments);
     res.status(201).json({
       status: 'processed',
+      jobId,
       filename: req.file.originalname,
       storedAs: req.file.filename,
       size: req.file.size,
@@ -307,6 +530,7 @@ app.post('/upload', upload.single('video'), async (req, res) => {
       strokesCsv: analysis.strokesCsv,
     });
   } catch (error) {
+    await failAnalysisJob(jobId, error.message);
     console.error('--- Analysis failed ---');
     console.error(error.stderr || error.stdout || error.message);
     res.status(500).json({ error: 'Video analysis failed' });
